@@ -1,0 +1,482 @@
+# AutoViral v2 — 100% Self-Hosted Stack (R$300 Budget)
+# Single VPS, CPU-only, zero external APIs
+# Usage: docker compose -f docker-compose.fully-selfhosted.yml up -d
+
+version: '3.8'
+
+services:
+  # ──────────────────────────────────────────────────────────────
+  # EDGE PROXY — Traefik v3 (TLS termination, auto-discovery)
+  # ──────────────────────────────────────────────────────────────
+  traefik:
+    image: traefik:v3.0
+    container_name: autoviral-traefik
+    restart: unless-stopped
+    command:
+      - "--api.dashboard=false"
+      - "--api.insecure=false"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.docker.network=autoviral-internal"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+      - "--certificatesresolvers.letsencrypt.acme.email=${TRAEFIK_ACME_EMAIL}"
+      - "--certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json"
+      - "--certificatesresolvers.letsencrypt.acme.tlschallenge=true"
+      - "--log.level=WARN"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./data/letsencrypt:/letsencrypt
+    networks:
+      - autoviral-internal
+      - autoviral-public
+    labels:
+      - "traefik.enable=true"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ──────────────────────────────────────────────────────────────
+  # SECRETS MANAGEMENT — HashiCorp Vault (dev mode for simplicity)
+  # ──────────────────────────────────────────────────────────────
+  vault:
+    image: hashicorp/vault:1.15
+    container_name: autoviral-vault
+    restart: unless-stopped
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: ${VAULT_ROOT_TOKEN}
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+    cap_add:
+      - IPC_LOCK
+    volumes:
+      - ./data/vault:/vault/data
+    networks:
+      - autoviral-internal
+    healthcheck:
+      test: ["CMD", "vault", "status", "-address=http://localhost:8200"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ──────────────────────────────────────────────────────────────
+  # PRIMARY DATABASE — PostgreSQL 16
+  # ──────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: autoviral-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: autoviral
+      POSTGRES_USER: autoviral
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+    volumes:
+      - autoviral_pg:/var/lib/postgresql/data
+    networks:
+      - autoviral-internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U autoviral -d autoviral"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+
+  # ──────────────────────────────────────────────────────────────
+  # CACHE / QUEUE — Redis 7
+  # ──────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: autoviral-redis
+    restart: unless-stopped
+    command: redis-server --requirepass ${REDIS_PASSWORD} --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    networks:
+      - autoviral-internal
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 128M
+
+  # ──────────────────────────────────────────────────────────────
+  # OBJECT STORAGE — MinIO (S3-compatible, optional)
+  # ──────────────────────────────────────────────────────────────
+  minio:
+    image: minio/minio:latest
+    container_name: autoviral-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD}
+    volumes:
+      - minio_data:/data
+    networks:
+      - autoviral-internal
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+
+  # ──────────────────────────────────────────────────────────────
+  # LLM INFERENCE — Ollama (CPU-only, quantized models)
+  # ──────────────────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: autoviral-ollama
+    restart: unless-stopped
+    environment:
+      OLLAMA_HOST: 0.0.0.0:11434
+      OLLAMA_NUM_PARALLEL: 1
+      OLLAMA_MAX_LOADED_MODELS: 2
+    volumes:
+      - ollama_data:/root/.ollama
+    # Pull models on startup (tiny models for CPU-only)
+    entrypoint: ["/bin/sh", "-c", "ollama serve & sleep 10 && ollama pull qwen2.5:1.5b-q4_k_m && ollama pull gemma2:2b-q4_k_m && ollama pull nomic-embed-text && wait"]
+    networks:
+      - autoviral-internal
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:11434/api/tags"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 2G
+
+  # ──────────────────────────────────────────────────────────────
+  # TTS SERVICE — Piper TTS (CPU, optional V2)
+  # ──────────────────────────────────────────────────────────────
+  piper:
+    image: rhasspy/piper:latest
+    container_name: autoviral-piper
+    restart: unless-stopped
+    volumes:
+      - piper_data:/data
+    networks:
+      - autoviral-internal
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:5000/api/voices"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 512M
+
+  # ──────────────────────────────────────────────────────────────
+  # VIDEO EDITOR — hotclip (AGPL-3.0, headless CLI)
+  # ──────────────────────────────────────────────────────────────
+  hotclip:
+    build:
+      context: ./hotclip
+      dockerfile: Dockerfile.headless
+    container_name: autoviral-hotclip
+    restart: unless-stopped
+    environment:
+      HOTCLIP_LLM_BASE_URL: http://ollama:11434/v1
+      HOTCLIP_LLM_MODEL: qwen2.5:1.5b-q4_k_m
+      HOTCLIP_HEADLESS: "true"
+    volumes:
+      - ./data/videos:/data/videos:ro
+      - ./data/output:/data/output:rw
+      - hotclip_cache:/home/node/.cache/hotclip
+    networks:
+      - autoviral-internal
+    healthcheck:
+      test: ["CMD", "hotclip", "--version"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 1G
+
+  # ──────────────────────────────────────────────────────────────
+  # SOCIAL SCHEDULER — Postiz Self-Hosted (AGPL-3.0)
+  # ──────────────────────────────────────────────────────────────
+  postiz:
+    image: ghcr.io/gitroomhq/postiz-app:latest
+    container_name: autoviral-postiz
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://postiz:${POSTIZ_DB_PASSWORD}@postiz-db:5432/postiz
+      REDIS_URL: redis://:${REDIS_PASSWORD}@postiz-redis:6379
+      JWT_SECRET: ${POSTIZ_JWT_SECRET}
+      ENCRYPTION_KEY: ${POSTIZ_ENCRYPTION_KEY}
+      PORT: 3000
+    depends_on:
+      postiz-db:
+        condition: service_healthy
+      postiz-redis:
+        condition: service_healthy
+    networks:
+      - autoviral-internal
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/api/health"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 512M
+
+  postiz-db:
+    image: postgres:16-alpine
+    container_name: autoviral-postiz-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: postiz
+      POSTGRES_USER: postiz
+      POSTGRES_PASSWORD: ${POSTIZ_DB_PASSWORD}
+    volumes:
+      - postiz_pg:/var/lib/postgresql/data
+    networks:
+      - autoviral-internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postiz -d postiz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  postiz-redis:
+    image: redis:7-alpine
+    container_name: autoviral-postiz-redis
+    restart: unless-stopped
+    command: redis-server --requirepass ${REDIS_PASSWORD} --maxmemory 128mb --maxmemory-policy allkeys-lru
+    volumes:
+      - postiz_redis_data:/data
+    networks:
+      - autoviral-internal
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ──────────────────────────────────────────────────────────────
+  # YOUTUBE UPLOADER — youtube-upload CLI wrapper service
+  # ──────────────────────────────────────────────────────────────
+  youtube-uploader:
+    build:
+      context: ./services/youtube-uploader
+      dockerfile: Dockerfile
+    container_name: autoviral-youtube-uploader
+    restart: unless-stopped
+    environment:
+      YOUTUBE_CLIENT_SECRETS: /secrets/youtube/client_secrets.json
+      YOUTUBE_CREDENTIALS: /secrets/youtube/credentials.json
+      YOUTUBE_CATEGORY_ID: ${YOUTUBE_CATEGORY_ID:-22}
+      YOUTUBE_PRIVACY: ${YOUTUBE_PRIVACY:-private}
+    volumes:
+      - ./data/videos:/data/videos:ro
+      - ./secrets/youtube:/secrets/youtube:ro
+    networks:
+      - autoviral-internal
+    healthcheck:
+      test: ["CMD", "youtube-upload", "--help"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+
+  # ──────────────────────────────────────────────────────────────
+  # MAIN API — AutoViral FastAPI
+  # ──────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile
+    container_name: autoviral-api
+    restart: unless-stopped
+    environment:
+      # App
+      APP_ENV: production
+      DEBUG: "false"
+      LOG_LEVEL: INFO
+      
+      # Database
+      DATABASE_URL: postgresql+asyncpg://autoviral:${POSTGRES_PASSWORD}@postgres:5432/autoviral
+      
+      # Redis
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      
+      # Vault
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN: ${VAULT_TOKEN}
+      VAULT_MOUNT_PATH: secret
+      
+      # Security
+      AUTOVIRAL_JWT_SECRET: ${AUTOVIRAL_JWT_SECRET}
+      AUTOVIRAL_ENCRYPTION_KEY: ${AUTOVIRAL_ENCRYPTION_KEY}
+      AUTOVIRAL_JWT_ALGORITHM: HS256
+      AUTOVIRAL_TOKEN_TTL_MIN: 180
+      FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:3000}
+      
+      # External Services
+      OLLAMA_BASE_URL: http://ollama:11434
+      HOTCLIP_URL: http://hotclip:3001
+      POSTIZ_URL: http://postiz:3000
+      POSTIZ_API_KEY: ${POSTIZ_API_KEY}
+      YOUTUBE_UPLOADER_URL: http://youtube-uploader:8000
+      PIPER_URL: http://piper:5000
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: ${MINIO_PASSWORD}
+      
+      # Processing
+      MAX_CONCURRENT_JOBS: 1
+      DEFAULT_LOCALE: pt-BR
+      WHISPER_MODEL: base
+      WHISPER_DEVICE: cpu
+      WHISPER_COMPUTE_TYPE: int8
+      
+      # Data directories
+      AUTOVIRAL_DATA_DIR: /data
+      
+    volumes:
+      - ./data:/data:rw
+      - ./secrets:/secrets:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      vault:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+      hotclip:
+        condition: service_healthy
+      postiz:
+        condition: service_healthy
+      piper:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      youtube-uploader:
+        condition: service_healthy
+    networks:
+      - autoviral-internal
+      - autoviral-public
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.autoviral.rule=Host(`${TRAEFIK_DOMAIN}`)"
+      - "traefik.http.routers.autoviral.entrypoints=websecure"
+      - "traefik.http.routers.autoviral.tls.certresolver=letsencrypt"
+      - "traefik.http.services.autoviral.loadbalancer.server.port=8000"
+    networks:
+      - autoviral-internal
+      - autoviral-public
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 1G
+
+  # ──────────────────────────────────────────────────────────────
+  # FRONTEND — React + Vite (optional, can be served by Traefik)
+  # ──────────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: https://${TRAEFIK_DOMAIN}/api/v1
+    container_name: autoviral-frontend
+    restart: unless-stopped
+    networks:
+      - autoviral-public
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.frontend.rule=Host(`${TRAEFIK_DOMAIN}`)"
+      - "traefik.http.routers.frontend.entrypoints=websecure"
+      - "traefik.http.routers.frontend.tls.certresolver=letsencrypt"
+      - "traefik.http.services.frontend.loadbalancer.server.port=80"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:80"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 128M
+
+# ──────────────────────────────────────────────────────────────
+# NETWORKS
+# ──────────────────────────────────────────────────────────────
+networks:
+  autoviral-internal:
+    driver: bridge
+    internal: true
+    name: autoviral-internal
+  autoviral-public:
+    driver: bridge
+    internal: false
+    name: autoviral-public
+
+# ──────────────────────────────────────────────────────────────
+# VOLUMES
+# ──────────────────────────────────────────────────────────────
+volumes:
+  autoviral_pg:
+  redis_data:
+  minio_data:
+  ollama_data:
+  piper_data:
+  hotclip_cache:
+  postiz_pg:
+  postiz_redis_data:

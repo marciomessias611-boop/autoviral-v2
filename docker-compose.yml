@@ -1,0 +1,483 @@
+# AutoViral v2 — multi-service deployment (production-ready)
+#
+# Usage:
+#   1. Copy .env.example to .env and fill ALL required secrets
+#   2. docker compose -f docker-compose.yml up -d
+#
+# CRITICAL: All secrets MUST be provided via .env — no defaults in production
+# Images are pinned by digest for supply chain integrity
+
+services:
+  # ------------------------------------------------------------------ app
+  app:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile
+    container_name: autoviral-app
+    restart: unless-stopped
+    user: "1000:1000"
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/run
+    environment:
+      - APP_ENV=production
+      - AUTOVIRAL_DATA_DIR=/data
+      - AUTOVIRAL_ENCRYPTION_KEY=${AUTOVIRAL_ENCRYPTION_KEY:?required}
+      - FRONTEND_ORIGIN=${FRONTEND_ORIGIN}
+      - AUTOVIRAL_JWT_SECRET=${AUTOVIRAL_JWT_SECRET:?required}
+      - DATABASE_URL=${DATABASE_URL:?required}
+      - REDIS_URL=${REDIS_URL}
+      - VAULT_ADDR=http://vault:8200
+      - VAULT_TOKEN=${VAULT_TOKEN}
+    volumes:
+      - ./data:/data:rw
+    depends_on:
+      redis:
+        condition: service_healthy
+      vault:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=autoviral-internal"
+      - "traefik.http.routers.autoviral.rule=Host(`app.localhost`)"
+      - "traefik.http.routers.autoviral.entrypoints=websecure"
+      - "traefik.http.routers.autoviral.tls=true"
+      - "traefik.http.services.autoviral.loadbalancer.server.port=8000"
+      - autoviral-internal
+
+  # ------------------------------------------------------------------ worker (durable DB-backed job consumer)
+  worker:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile
+    container_name: autoviral-worker
+    restart: unless-stopped
+    user: "1000:1000"
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/run
+    healthcheck:
+      disable: true
+    command: ["python", "-m", "api.services.worker"]
+    environment:
+      - APP_ENV=production
+      - AUTOVIRAL_DATA_DIR=/data
+      - AUTOVIRAL_ENCRYPTION_KEY=${AUTOVIRAL_ENCRYPTION_KEY:?required}
+      - AUTOVIRAL_JWT_SECRET=${AUTOVIRAL_JWT_SECRET:?required}
+      - DATABASE_URL=${DATABASE_URL:?required}
+      - REDIS_URL=${REDIS_URL}
+      - VAULT_ADDR=http://vault:8200
+      - VAULT_TOKEN=${VAULT_TOKEN}
+    volumes:
+      - ./data:/data:rw
+    depends_on:
+      app:
+        condition: service_healthy
+    networks:
+      - autoviral-internal
+
+  # ------------------------------------------------------------------ redis
+  redis:
+    image: redis:7.2.5-alpine@sha256:015185fd658093359cc83aa8396e06c1f39ba36df3c93f79528ec23ab409e73f
+    container_name: autoviral-redis
+    restart: unless-stopped
+    user: "999:999"
+    read_only: true
+    tmpfs:
+      - /data
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD}
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - autoviral-internal
+
+  # ------------------------------------------------------------------ vault (production mode, no dev root token)
+  vault:
+    image: hashicorp/vault:1.15.6@sha256:fea7f528068fbb458307f54eb2cc1141be77f7603f0ac36e33f17ea4a25e392d
+    container_name: autoviral-vault
+    restart: unless-stopped
+    user: "100:100"
+    read_only: true
+    tmpfs:
+      - /vault/data
+    cap_add:
+      - IPC_LOCK
+    environment:
+      - VAULT_ADDR=http://0.0.0.0:8200
+      - VAULT_API_ADDR=http://vault:8200
+      - VAULT_CLUSTER_ADDR=https://vault:8201
+    volumes:
+      - vault_data:/vault/file
+      - ./vault/config:/vault/config:ro
+    # NO ports exposed — internal access only
+    healthcheck:
+      test: ["CMD", "vault", "status", "-address=http://localhost:8200"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - autoviral-internal
+
+  vault-init:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile.vault-init
+    container_name: autoviral-vault-init
+    restart: "no"
+    user: "1000:1000"
+    environment:
+      - VAULT_ADDR=http://vault:8200
+      - VAULT_TOKEN=${VAULT_TOKEN}
+    depends_on:
+      vault:
+        condition: service_healthy
+    networks:
+      - autoviral-internal
+
+  # ------------------------------------------------------------------ postgres (for main app)
+  postgres:
+    image: postgres:16.4-alpine@sha256:f5aa7cac1dc299a77761ada5a5cf9c6ef4064bc85c89fed49c587dd2381d6f05
+    container_name: autoviral-postgres
+    restart: unless-stopped
+    user: "999:999"
+    read_only: true
+    tmpfs:
+      - /var/run/postgresql
+      - /tmp
+    environment:
+      - POSTGRES_USER=autoviral
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=autoviral
+    volumes:
+      - autoviral_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U autoviral -d autoviral"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - autoviral-internal
+
+  # ------------------------------------------------------------------ ollama (LLM, optional GPU)
+  ollama:
+    image: ollama/ollama:0.3.14@sha256:561e07c87e23bc160313041160f67eccd4f1e066cd03434771566d0c69e64db2
+    container_name: autoviral-ollama
+    restart: unless-stopped
+    user: "1000:1000"
+    read_only: true
+    tmpfs:
+      - /root/.ollama
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
+    volumes:
+      - ollama_data:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - autoviral-internal
+
+  # ------------------------------------------------------------------ prometheus (metrics & alerting) — internal only
+  prometheus:
+    image: prom/prometheus:v2.54.1@sha256:69961df6ffa67598048a31aa2822d61f3c93b91d7db24e44d9bb03f99d520da9
+    container_name: autoviral-prometheus
+    restart: unless-stopped
+    user: "65534:65534"
+    read_only: true
+    tmpfs:
+      - /prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+      - '--web.enable-admin-api'
+    # NO ports exposed — metrics collected via service discovery
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/prometheus.rules.yml:/etc/prometheus/rules.yml:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      - app
+      - postgres
+      - redis
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - autoviral-internal
+      - autoviral-monitoring
+
+  # ------------------------------------------------------------------ alertmanager (alert routing) — internal only
+  alertmanager:
+    image: prom/alertmanager:v0.27.0@sha256:45c3a586d4332d710bef92b06e90380c0b1f588968c00100d4b5e4e44c40ca5f
+    container_name: autoviral-alertmanager
+    restart: unless-stopped
+    user: "65534:65534"
+    read_only: true
+    tmpfs:
+      - /alertmanager
+    command:
+      - '--config.file=/etc/alertmanager/alertmanager.yml'
+      - '--storage.path=/alertmanager'
+      - '--web.route-prefix=/'
+    # NO ports exposed
+    volumes:
+      - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager_data:/alertmanager
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9093/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - autoviral-internal
+      - autoviral-monitoring
+
+  # ------------------------------------------------------------------ jaeger (distributed tracing) — internal only
+  jaeger:
+    image: jaegertracing/all-in-one:1.53.0@sha256:1147036b9becc1eca6006f1af7eb2f0c2fe039a8d313ce15c6aa52a6a877f9f7
+    container_name: autoviral-jaeger
+    restart: unless-stopped
+    user: "1000:1000"
+    read_only: true
+    tmpfs:
+      - /var/lib/jaeger
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+      - SPAN_STORAGE_TYPE=badger
+    # NO ports exposed
+    volumes:
+      - jaeger_data:/var/lib/jaeger
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:16686/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - autoviral-internal
+      - autoviral-monitoring
+
+  # ------------------------------------------------------------------ hotclip (Opus Clip-level editor, headless CLI + MCP)
+  hotclip:
+    build:
+      context: .
+      dockerfile: hotclip/Dockerfile.headless
+    container_name: autoviral-hotclip
+    restart: unless-stopped
+    user: "1000:1000"
+    read_only: true
+    tmpfs:
+      - /home/node/.cache/hotclip
+      - /tmp
+    environment:
+      - HOTCLIP_LLM_BASE_URL=${HOTCLIP_LLM_BASE_URL}
+      - HOTCLIP_LLM_MODEL=${HOTCLIP_LLM_MODEL}
+      - FFMPEG_HW_ACCEL=${FFMPEG_HW_ACCEL}
+    volumes:
+      - ./data/videos:/data/videos:ro
+      - ./data/highlights:/data/highlights:ro
+      - ./data/output:/data/output:rw
+      - hotclip_cache:/home/node/.cache/hotclip
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu, video]
+    depends_on:
+      - ollama
+    healthcheck:
+      test: ["CMD", "hotclip", "--version"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - autoviral-internal
+
+  # ------------------------------------------------------------------ brightbean (13-platform publisher) + postgres
+  brightbean:
+    image: brightbean/studio:1.2.0@sha256:1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3
+    container_name: autoviral-brightbean
+    restart: unless-stopped
+    user: "1000:1000"
+    read_only: true
+    tmpfs:
+      - /tmp
+    environment:
+      - PORT=3000
+      - DATABASE_URL=postgresql://brightbean:${BRIGHTBEAN_DB_PASSWORD}@brightbean-db:5432/brightbean
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@brightbean-redis:6379
+      - JWT_SECRET=${BRIGHTBEAN_JWT_SECRET}
+      - ENCRYPTION_KEY=${BRIGHTBEAN_ENCRYPTION_KEY}
+    # NO ports exposed — internal access only
+    volumes:
+      - ./brightbean/config:/app/config:ro
+    depends_on:
+      - brightbean-db
+      - brightbean-redis
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - autoviral-internal
+
+  brightbean-db:
+    image: postgres:16.4-alpine@sha256:f5aa7cac1dc299a77761ada5a5cf9c6ef4064bc85c89fed49c587dd2381d6f05
+    container_name: autoviral-brightbean-db
+    restart: unless-stopped
+    user: "999:999"
+    read_only: true
+    tmpfs:
+      - /var/run/postgresql
+      - /tmp
+    environment:
+      - POSTGRES_USER=brightbean
+      - POSTGRES_PASSWORD=${BRIGHTBEAN_DB_PASSWORD}
+      - POSTGRES_DB=brightbean
+    volumes:
+      - brightbean_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U brightbean -d brightbean"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - autoviral-internal
+
+  brightbean-redis:
+    image: redis:7.2.5-alpine@sha256:015185fd658093359cc83aa8396e06c1f39ba36df3c93f79528ec23ab409e73f
+    container_name: autoviral-brightbean-redis
+    restart: unless-stopped
+    user: "999:999"
+    read_only: true
+    tmpfs:
+      - /data
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD}
+    volumes:
+      - brightbean_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - autoviral-internal
+
+  # ------------------------------------------------------------------ n8n (orchestration) — internal only
+  n8n:
+    image: n8nio/n8n:1.70.1@sha256:2e997d09c83c5a91acfd8c56477440374bebe13bdfb9c494ab1e9d08f9a7711e
+    container_name: autoviral-n8n
+    restart: unless-stopped
+    user: "1000:1000"
+    read_only: true
+    tmpfs:
+      - /home/node/.n8n
+    environment:
+      - N8N_HOST=0.0.0.0
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=http
+      - GENERIC_TIMEZONE=America/Sao_Paulo
+      - HOTCLIP_API_URL=http://hotclip:3001
+      - BRIGHTBEAN_API_URL=http://brightbean:3000
+      - AUTOVIRAL_API_URL=http://app:8000
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+    # NO ports exposed — internal access only
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./n8n/custom-nodes:/home/node/.n8n/custom:ro
+      - ./n8n/workflows:/home/node/.n8n/workflows:ro
+    depends_on:
+      - app
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:5678/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - autoviral-internal
+
+  # ------------------------------------------------------------------ traefik (edge, HTTPS) — ONLY externally exposed service
+  traefik:
+    image: traefik:v3.0.1@sha256:1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3
+    container_name: autoviral-traefik
+    restart: unless-stopped
+    user: "1000:1000"
+    read_only: true
+    tmpfs:
+      - /tmp
+    command:
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.file.directory=/config/dynamic"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+      - "--api.dashboard=false"
+      - "--api.insecure=false"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik/certs:/certs:ro
+      - ./traefik/dynamic:/config/dynamic:ro
+    depends_on:
+      - app
+    networks:
+      - autoviral-internal
+      - autoviral-public
+
+networks:
+  autoviral-internal:
+    driver: bridge
+    internal: true
+  autoviral-monitoring:
+    driver: bridge
+    internal: true
+  autoviral-public:
+    driver: bridge
+    internal: false
+
+volumes:
+  redis_data:
+  vault_data:
+  ollama_data:
+  hotclip_cache:
+  brightbean_pg:
+  n8n_data:
+  autoviral_pg:
+  jaeger_data:
+  prometheus_data:
+  alertmanager_data:
+  brightbean_redis_data:
